@@ -1,0 +1,386 @@
+---
+title: "Final Project Report"
+author: "Jerry Yu"
+date: "2026-03-12"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## STA 141A: Predicting Wildfire Incidence in the United States
+
+### Overview:
+
+This report focuses on data from a subset of wildfires in the United States derived from the Kaggle dataset "*188 Million US Wildfires*". and aims to develop a prediction model for the incidence and location of said fires.
+
+The overall results are as follows:
+
+The report focuses on only fires that are larger than 100 acres because the large majority of reported fires in the data set are very small (1 acre or less) to get a better grasp of what causes notable fires. Longitude, Latitude, Year, Monthly cycle, and average fire size are the variables which were considered in the logistic and XGBoost models used in the report as they cover the space, time, and size of fires in the data set. In the XGBoost model, latitude, longitude, year, and avg fire size accounted for about 70% of the gain. The XGBoost model surprisingly ended up performing worse than the logistic model when comparing their AUC to each other. The findings suggest that there are often months with far more fires and area burnt than others. While this means that fire season is often predictable, where the fires will occur is a different issue, as large fires seem to happen over long periods of time, where burnable material are allowed to gather for a large fire to form.
+
+## Data Preprocessing
+
+```{r}
+# Loading the dataset and libraries
+
+suppressWarnings(suppressMessages({
+  wildfires <- read.csv(file = "C:/Users/oldfi/Documents/sta 141A/Data/wildfires_sample_100k.csv")
+  library(tidyverse) 
+  library(scales)
+  library(caret)
+  library(Matrix)
+  library(xgboost)
+  library(pROC)
+}))
+
+```
+
+### Handling NA values
+
+```{r}
+NA_cols <- names(wildfires)[sapply(wildfires, function(x) any(is.na(x)))]
+NA_cols
+sum(is.na(wildfires$COUNTY))
+```
+
+We will not consider any of the variables that contain NA values as the majority of them do not appear relevant to predicting when and where a future fire may occur. Additionally, about 36% of County data contains NA values, thus it will not be considered as a spatial unit
+
+### Choosing relevant fires
+
+```{r}
+
+box <- ggplot(wildfires, aes(x = FIRE_SIZE_CLASS, y = FIRE_SIZE, fill = FIRE_SIZE_CLASS)) +
+  geom_boxplot() +
+  scale_y_log10() +
+  labs(
+  title = "Firesize box plot (log scaled)",
+  x = "Fire Size Class",
+  y = "Fire Size in acres"
+) 
+print(box)
+
+
+head(wildfires %>% filter(FIRE_SIZE_CLASS == "C") %>% select(FIRE_SIZE) %>% arrange(desc(FIRE_SIZE)), n = 1)
+
+
+```
+
+We create a box plot by log scale and see that even on a log scale, there are many very small fires and for notable fires. We then see than the largest fire in class C burned 99.7 acres, thus only class D and above will be considered. This is because there can be extremely large fires that burn hundreds of thousands of acres which are much more influential than smaller fires that burn a few tens of acres.
+
+### Choosing relevant fire threshold
+
+```{r}
+
+
+relevant_fires <- wildfires %>% select(FIRE_SIZE, FIRE_YEAR, FIRE_SIZE_CLASS, STATE, LONGITUDE, LATITUDE, STAT_CAUSE_DESCR, DISCOVERY_DOY) %>%
+  mutate(MONTH = month(as.Date(DISCOVERY_DOY - 1, origin = paste0(FIRE_YEAR, "-01-01"))),
+  notable_fire = ifelse(FIRE_SIZE_CLASS > "C", 1, 0),
+  lat_bin = floor(LATITUDE),
+  lon_bin = floor(LONGITUDE),
+  ym = FIRE_YEAR * 100 + MONTH
+) %>%
+  filter(notable_fire == 1)
+  
+  # Adding month (by number) based off of Discovery DOY 
+  # And binary outcome as fires class d and above being 1 and below being 0
+
+```
+
+Each of the variables we are filtering for in the relevant fires has a purpose. FIRE_SIZE and STAT_CAUSE_DESCR for predicting at how big a fire might be, FIRE_YEAR, DISCOVERY_DOY for seeing which years or time of year is prone to fires, and LONGITUDE, LATITUDE, and STATE for the location of these fires, etc.
+
+### Spatial Patterns
+
+```{r}
+
+grid_month_fire <- relevant_fires %>%
+  group_by(lat_bin, lon_bin, ym) %>%
+  summarise(
+    fire_count = n(),
+    any_fire = 1,
+    avg_size = mean(FIRE_SIZE, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+all_grids <- grid_month_fire %>% distinct(lat_bin, lon_bin)
+
+start_date <- ymd(paste0(min(grid_month_fire$ym) %/% 100, "-", min(grid_month_fire$ym) %% 100, "-01"))
+end_date   <- ymd(paste0(max(grid_month_fire$ym) %/% 100, "-", max(grid_month_fire$ym) %% 100, "-01"))
+
+all_months <- tibble(date = seq.Date(start_date, end_date, by = "month")) %>%
+  mutate(
+    year = year(date), 
+    month = month(date), 
+    ym = year * 100 + month
+  ) %>%
+  select(ym, year, month)
+
+panel <- crossing(all_grids, all_months) %>%
+  left_join(grid_month_fire, by = c("lat_bin", "lon_bin", "ym")) %>%
+  mutate(
+    fire_count = replace_na(fire_count, 0),
+    any_fire   = replace_na(any_fire, 0)
+  )
+
+mode_state <- function(x) {
+  ux <- unique(x)
+  ux[which.max(tabulate(match(x, ux)))]
+}
+
+grid_state <- relevant_fires %>%
+  group_by(lat_bin, lon_bin) %>%
+  summarise(STATE = mode_state(STATE), .groups = 'drop')
+
+panel <- panel %>%
+  left_join(grid_state, by = c("lat_bin", "lon_bin"))
+
+
+panel <- panel %>%
+  mutate(
+    month_sin = sin(2 * pi * month / 12),
+    month_cos = cos(2 * pi * month / 12)
+  )
+
+panel <- panel %>%
+  group_by(lat_bin, lon_bin) %>%
+  arrange(ym) %>%
+  mutate(next_month_fire = lead(any_fire, n = 1)) %>%
+  ungroup()
+
+```
+
+We create a lattitude-longitude 1 \* 1 grid and construct a complete grid x month panel to use later on in EDA.
+
+### Data Summary Table
+
+```{r}
+
+
+summary <- relevant_fires %>% summarise(
+  Notable_fires = n(),
+  Median_Notable_Size = median(FIRE_SIZE[notable_fire == 1]),
+  Year_range = paste(min(FIRE_YEAR), "-", max(FIRE_YEAR)),
+  Primary_Cause = names(which.max(table(STAT_CAUSE_DESCR))),
+  Peak_Month    = names(which.max(table(MONTH))),
+)
+
+print(summary)
+
+```
+
+This is the final data set that will be used for EDA
+
+## Exploratory Data Analysis
+
+The topic that will be explored is the probability of notable fires with relation to the next month, as well as the relationship between mean size and total acres burned across every month to see effects of seasonality.
+
+```{r}
+
+
+eda_spatial <- panel %>%
+  group_by(lat_bin, lon_bin) %>%
+  summarise(
+    fire_rate = mean(any_fire, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+ggplot(eda_spatial, aes(x = lon_bin, y = lat_bin, fill = fire_rate)) + 
+  geom_tile() +
+  scale_fill_viridis_c(option = "inferno") + 
+  labs(
+    title = "Mean next-month notable-fire rate by grid cell",
+    x = "Longitude bin (floor)",
+    y = "Latitude bin (floor)",
+    fill = "Mean Rate"
+  )
+
+```
+
+This plot observes the mean probability of a notable fire happening in the next month in each grid cell. The majority of areas have a very low mean rate for notable fires, possibly because areas with large fires often need time to build up more burnable material.
+
+```{r}
+
+seasonal_severity <- panel %>%
+  filter(any_fire == 1) %>% 
+  group_by(month) %>%
+  summarise(
+    mean_size = mean(avg_size, na.rm = TRUE),
+    median_size = median(avg_size, na.rm = TRUE),
+    total_area = sum(avg_size, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+seasonal_long <- seasonal_severity %>%
+  select(month, mean_size, total_area) %>%
+  pivot_longer(cols = c(mean_size, total_area), names_to = "metric", values_to = "value")
+
+ggplot(seasonal_long, aes(x = factor(month), y = value, fill = metric)) +
+  geom_col() +
+  facet_wrap(~metric, scales = "free_y", ncol = 1) + 
+  scale_fill_manual(values = c("mean_size" = "darkblue", "total_area" = "firebrick")) +
+  labs(
+    title = "Monthly Fire data",
+    x = "Month",
+    y = "Acres burned"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+```
+
+This graph looks at the ties between seasonality and the average size and total area of land burned by wildfires for each month of the year. We can see that while the mean size appears to correlate with total acres burned in most months, October seems to have a much higher average fire size compared to the total amount burned.
+
+## Model Fitting
+
+### Logistic Regression
+
+First a baseline model of logistic regression will be considered
+
+```{r}
+# The equation of the logistic model can be represented as 
+# logit(p) = ln(p/(1-p)) =
+# \beta0 + \beta1 * sin(2pi*Month/12) + \beta2 * cos(2pi*month/12) + \beta3 * log(1 + AvgSize) + \beta4 * Year + \gamma * state
+
+  model_data <- panel %>%
+    filter(!is.na(next_month_fire))
+  
+  base_model <- glm(
+    next_month_fire ~ 
+      month_sin + month_cos +
+      log1p(avg_size) +       
+      year +                  
+      STATE,                  
+    data = model_data, 
+    family = binomial(link = "logit")
+  )
+  
+importance_logit <- varImp(base_model, scale = FALSE)
+
+head(importance_logit %>% arrange(desc(Overall)))
+# months and year seem to be the strongest signals in the data
+```
+
+This logistic regression takes into account month_sin and month_cos to try to take into account seasonality, log average fire size for intensity, year for long-term trends and state for spatial differences.
+
+### Gradient boosted trees
+
+```{r}
+# The schematic for the XGBoost model is as follows:
+# 1. input variables
+# 2. Tree 1 makes an initial prediction of fire probs
+# 3. residual calculation between actual values and predicted values
+# 4. Tree 2 trains to fix the errors by Tree 1
+# 5. Iterate for k rounds
+# 6. obtain final output
+
+set.seed(1)
+
+data_final <- panel %>%
+  filter(!is.na(next_month_fire)) %>% 
+  select(next_month_fire, year, month_sin, month_cos, avg_size, lat_bin, lon_bin, STATE) %>%
+  mutate(avg_size = log1p(avg_size)) %>% 
+  na.omit()
+
+X_matrix <- model.matrix(next_month_fire ~ . -1, data = data_final)
+Y_vector <- data_final$next_month_fire
+
+parts = createDataPartition(data_final$next_month_fire, p = .8, list = F)
+
+train_x = X_matrix[parts, ]
+train_y = Y_vector[parts]
+test_x  = X_matrix[-parts, ]
+test_y  = Y_vector[-parts]
+
+xgb_train = xgb.DMatrix(data = train_x, label = train_y)
+xgb_test = xgb.DMatrix(data = test_x, label = test_y)
+
+watchlist = list(train=xgb_train, test=xgb_test)
+
+
+params <- list(
+  objective = "binary:logistic",
+  max_depth = 3
+)
+
+model = xgb.train(data = xgb_train, 
+                  params = params,
+                  nrounds = 100, 
+                  evals = list(train = xgb_train, test = xgb_test),
+                  verbose = 0)
+
+
+
+final_model = xgb.train(
+  params = params,
+  data = xgb_train, 
+  nrounds = 18, 
+  evals = list(train = xgb_train, test = xgb_test),
+  verbose = 0
+)
+
+# Since in the first model, at 18 iterations is when test logloss was the least, we use it for the final one.
+
+pred_probs <- predict(final_model, xgb_test)
+pred_y <- ifelse(pred_probs > 0.2, 1, 0)
+
+
+importance_matrix <- xgb.importance(feature_names = colnames(train_x), model = final_model)
+
+head(importance_matrix)
+
+```
+
+The variables used in the model include long/latitude, year for long term trends, average fire size, and a sin/cos transformation of month for seasonal cycle. This XGBoost model identifies latitude and longitude, year, and the average size of a fire as the strongest predictors of wildfire risk. They account for a little under 70% of the total model's gain.
+
+## Model Validation
+
+```{r}
+
+test_df <- data_final[-parts, ]
+
+test_df$prob_logit <- predict(base_model, newdata = test_df, type = "response")
+test_df$prob_xgb   <- predict(final_model, xgb_test)
+
+
+safe_auc <- function(outcome, prediction) {
+  if (length(unique(outcome)) < 2) {
+    return(NA) 
+  }
+  as.numeric(pROC::auc(pROC::roc(outcome, prediction, quiet = TRUE)))
+}
+
+auc_compare <- test_df %>%
+  group_by(year) %>%
+  summarise(
+    Logit = safe_auc(next_month_fire, prob_logit),
+    XGBoost = safe_auc(next_month_fire, prob_xgb),
+    .groups = 'drop'
+  ) %>%
+  filter(!is.na(Logit) & !is.na(XGBoost))
+
+plot_data <- auc_compare %>%
+  pivot_longer(cols = c(Logit, XGBoost), 
+               names_to = "Model", 
+               values_to = "AUC")
+
+ggplot(plot_data, aes(x = year, y = AUC, color = Model, group = Model)) +
+  geom_line(linewidth = 1.2, alpha = 0.8) +
+  geom_point(size = 2) +
+  theme_minimal() +
+  labs(
+    title = "AUC by validation year",
+    x = "Year",
+    y = "AUC",
+    color = "Model Type"
+  ) 
+
+
+```
+
+The above is a comparison in the AUC values of both the logistic model and the XGBoost model
+
+## Summary
+
+The findings of this report suggest that when looking at this data set of 100000 fires and looking at only notable fires (100+ acres burned), seasonality is a strong proponent of notable fires, which can be seen through the bar graphs in the EDA section. The Mean next-month graph plot also shows that most areas have a very low rate of notable fires. The fact that some months burn much more than others yet the per month rate of notable fires stays low may suggest that notable fires need time for burnable material to gather before a reaction happens. Several predictors were very important in building the models, such as location (longitude and latitude), Year, and average fire size. This implies that risk is high in places with historically high average fire sizes.
+
+Additionally, the Logistic Regression model was, on average, outperforming the XGBoost model in terms of AUC. This might suggest that the underlying data is somehow linear or that it may have over fitted compared to the logistic regression model.
